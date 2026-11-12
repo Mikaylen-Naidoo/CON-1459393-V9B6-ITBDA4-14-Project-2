@@ -1,0 +1,168 @@
+---
+title: "Question 1 - Keyword search with Hadoop Streaming MapReduce (R)"
+subtitle: "ITBDA4-14 Project 2 - analytics flow notebook"
+output:
+  github_document:
+    toc: true
+    html_preview: false
+params:
+  keyword: "africa"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "#>")
+library(ggplot2)
+rscript   <- file.path(R.home("bin"), "Rscript")
+input_dir <- "data/map_reduce_test_docs"
+```
+
+## 1. Problem and design (question 1.1)
+
+**Task.** Search a corpus of news articles for a keyword (case-insensitive) and return the **row (line number)** and **column (character position)** of every match in every document. The keyword is a runtime input, never hardcoded.
+
+**MapReduce design** (R scripts run through Hadoop Streaming):
+
+```
+ documents + keyword
+        |
+   [ Mapper 1 ]  [ Mapper 2 ] ... [ Mapper 7 ]    one mapper per document (input split)
+        |  emit:  filename <TAB> row <TAB> column
+        v
+   Shuffle and sort  (group records by filename)
+        |
+   [ Reducer ]        count and sort the (row, column) pairs per file
+        |
+   part-00000:  filename <TAB> total <TAB> (row,col) (row,col) ...
+```
+
+Matching rules: whole word, case-insensitive, row and column start at 1, blank lines count as rows, and every occurrence on a line is reported.
+
+## 2. Input data
+
+```{r input}
+files <- sort(list.files(input_dir, pattern = "\\.txt$", full.names = TRUE, recursive = TRUE))
+files <- files[!grepl("__MACOSX", files)]
+corpus <- data.frame(
+  document = basename(files),
+  lines    = vapply(files, function(f) length(readLines(f, warn = FALSE)), integer(1)),
+  words    = vapply(files, function(f) length(scan(f, what = "", quiet = TRUE, encoding = "UTF-8")), integer(1)),
+  row.names = NULL
+)
+knitr::kable(corpus, caption = "Documents in the corpus")
+```
+
+## 3. Mapper (question 1.2)
+
+`mapper.R` reads one document from standard input and emits one record per match. The keyword is passed as a command-line argument.
+
+```{r mapper-code, echo = FALSE, comment = ""}
+cat(readLines("mapper.R", warn = FALSE), sep = "\n")
+```
+
+## 4. Reducer (question 1.3)
+
+`reducer.R` receives the sorted records and writes one summary line per document.
+
+```{r reducer-code, echo = FALSE, comment = ""}
+cat(readLines("reducer.R", warn = FALSE), sep = "\n")
+```
+
+## 5. Running the job
+
+Hadoop is not installed on the development machine, so the pipeline is simulated locally with exactly the same scripts: one mapper process per document, the same `mapreduce_map_input_file` variable that Hadoop sets, a sort by key, then the reducer.
+
+```{r pipeline}
+run_pipeline <- function(keyword) {
+  map_out <- character(0)
+  for (f in files) {
+    Sys.setenv(mapreduce_map_input_file = f)               # what Hadoop sets for each split
+    out <- system2(rscript, c("mapper.R", shQuote(keyword)), stdin = f, stdout = TRUE)
+    map_out <- c(map_out, out)
+  }
+  if (length(map_out) == 0) return(list(map = map_out, shuffled = map_out, reduced = map_out))
+  key      <- sub("\t.*", "", map_out)
+  shuffled <- map_out[order(key, method = "radix")]        # shuffle and sort: group by filename
+  tmp      <- tempfile(); writeLines(shuffled, tmp)
+  list(map = map_out, shuffled = shuffled,
+       reduced = system2(rscript, "reducer.R", stdin = tmp, stdout = TRUE))
+}
+
+res <- run_pipeline(params$keyword)
+```
+
+### Mapper output (filename, row, column)
+
+```{r map-output}
+map_df <- read.table(text = res$map, sep = "\t", col.names = c("document", "row", "column"), stringsAsFactors = FALSE)
+knitr::kable(map_df, caption = paste0("Records emitted by the mappers for the keyword '", params$keyword, "'"))
+```
+
+### Reducer output (final result)
+
+```{r reduce-output}
+red_df <- read.table(text = res$reduced, sep = "\t", quote = "", col.names = c("document", "matches", "positions (row,col)"),
+                     stringsAsFactors = FALSE, check.names = FALSE)
+knitr::kable(red_df, caption = "Final result: matches and positions per document")
+```
+
+```{r result-plot, fig.width = 7, fig.height = 3.5}
+counts <- merge(corpus["document"], red_df[, c("document", "matches")], all.x = TRUE)
+counts$matches[is.na(counts$matches)] <- 0
+ggplot(counts, aes(x = document, y = matches)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = matches), vjust = -0.4) +
+  labs(title = paste0("Matches for the keyword '", params$keyword, "' per document"),
+       x = "Document", y = "Number of matches") +
+  theme_minimal(base_size = 12)
+```
+
+## 6. Validation against an independent check
+
+The result is compared with a direct regular-expression search over the same files, written separately from the mapper.
+
+```{r validation}
+direct <- do.call(rbind, lapply(files, function(f) {
+  txt <- readLines(f, warn = FALSE, encoding = "UTF-8"); Encoding(txt) <- "UTF-8"
+  hits <- lapply(seq_along(txt), function(i) {
+    m <- gregexpr(paste0("(?i)\\b", params$keyword, "\\b"), txt[i], perl = TRUE)[[1]]
+    if (m[1] == -1) NULL else data.frame(document = basename(f), row = i, column = as.integer(m))
+  })
+  do.call(rbind, hits)
+}))
+cat("Total matches - MapReduce:", nrow(map_df), "| direct search:", nrow(direct), "\n")
+a <- map_df[order(map_df$document, map_df$row, map_df$column), ]
+b <- direct[order(direct$document, direct$row, direct$column), ]
+cat("Identical row/column positions:", isTRUE(all.equal(a, b, check.attributes = FALSE)), "\n")
+```
+
+## 7. The keyword is dynamic
+
+The same code is re-run with a second keyword.
+
+```{r second-keyword}
+res2 <- run_pipeline("visa")
+knitr::kable(read.table(text = res2$reduced, sep = "\t", quote = "", col.names = c("document", "matches", "positions (row,col)"), check.names = FALSE),
+             caption = "Result for the keyword 'visa'")
+```
+
+To use another keyword, knit this notebook with `rmarkdown::render("Q1_MapReduce_Notebook.Rmd", params = list(keyword = "eskom"))`.
+
+## 8. Hadoop configuration (question 1.4)
+
+On a Hadoop cluster the same scripts are submitted with `run_job.sh`:
+
+```{r hadoop-config, echo = FALSE, comment = ""}
+cat(readLines("run_job.sh", warn = FALSE), sep = "\n")
+```
+
+| Setting | Purpose |
+|---|---|
+| `mapreduce.job.reduces=1` | One reducer, so one sorted output file `part-00000` |
+| `mapreduce.input.fileinputformat.split.minsize=1073741824` | Never split a file across mappers, so row numbers stay correct |
+| `stream.num.map.output.key.fields=1` | The filename is the key; row and column are the value |
+| `-files mapper.R,reducer.R` | Ship the scripts to every node |
+| `-mapper "Rscript mapper.R $KEYWORD"` | Pass the keyword at run time (dynamic input) |
+
+## 9. Summary
+
+The mapper turns every keyword occurrence into a `(file, row, column)` record, the shuffle groups the records by file, and the reducer produces a sorted list of positions per document. The result agrees with an independent search, and the keyword is a run-time parameter.

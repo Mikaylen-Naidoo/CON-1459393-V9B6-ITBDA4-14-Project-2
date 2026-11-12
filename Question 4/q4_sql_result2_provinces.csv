@@ -1,0 +1,10 @@
+"province","universities","total_students","pct_of_national_enrolment","enrolment_rank","imputed_enrolments","largest_university","largest_enrolment"
+"Gauteng",7,657942,54.5,1,0,"University of South Africa",420000
+"Western Cape",4,121326,10.1,2,0,"Stellenbosch University",35093
+"KwaZulu-Natal",4,107867,8.9,3,0,"University of KwaZulu-Natal",46539
+"Eastern Cape",4,79836,6.6,4,0,"Walter Sisulu University",31500
+"Free State",2,63162,5.2,5,0,"University of the Free State",41169
+"North West",1,56000,4.6,6,0,"North-West University",56000
+"Limpopo",2,50341,4.2,7,1,"University of Limpopo",35093
+"Mpumalanga",1,35093,2.9,8,1,"University of Mpumalanga",35093
+"Northern Cape",1,35093,2.9,8,1,"Sol Plaatje University",35093

@@ -1,0 +1,16 @@
+Summaries of: Natural language processing
+Source: Wikipedia, 'Natural language processing' (CC BY-SA 4.0), accessed 12 November 2026
+
+FREQUENCY-BASED EXTRACTIVE SUMMARY
+Natural language processing (NLP) is the processing of natural language information by a computer.
+Major processing tasks in an NLP system include: speech recognition, text classification, natural language understanding, and natural language generation.
+The premise of symbolic NLP is often illustrated using John Searle's Chinese room thought experiment: Given a collection of rules (e.g., a Chinese phrasebook, with questions and matching answers), the computer emulates natural language understanding (or other NLP tasks) by applying those rules to the data it confronts.
+Starting in the late 1980s, however, there was a revolution in natural language processing with the introduction of machine learning algorithms for language processing.
+However, some written languages like Chinese, Japanese and Thai do not mark word boundaries in such a fashion, and in those languages text segmentation is a significant task requiring knowledge of the vocabulary and morphology of words in the language.
+
+TEXTRANK EXTRACTIVE SUMMARY
+Natural language processing (NLP) is the processing of natural language information by a computer.
+Major processing tasks in an NLP system include: speech recognition, text classification, natural language understanding, and natural language generation.
+Up until the 1980s, most natural language processing systems were based on complex sets of hand-written rules.
+Starting in the late 1980s, however, there was a revolution in natural language processing with the introduction of machine learning algorithms for language processing.
+Machine learning approaches, which include both statistical and neural networks, on the other hand, have many advantages over the symbolic approach:

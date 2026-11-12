@@ -1,0 +1,274 @@
+---
+title: "Question 3 - Web text mining proof of concept (Wikipedia: Natural language processing)"
+subtitle: "ITBDA4-14 Project 2 - analytics flow notebook"
+output:
+  github_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "#>")
+suppressPackageStartupMessages({
+  library(rvest); library(xml2); library(tm); library(SnowballC)
+  library(ggplot2); library(wordcloud); library(RColorBrewer)
+})
+page_url <- "https://en.wikipedia.org/wiki/Natural_language_processing"
+snapshot <- "q3_raw_page.html"
+seed <- 1234
+```
+
+**Scenario.** An analytics company wants a web-search text mining API that reads a web link and generates insights from its content. This notebook is the proof of concept: scrape one page compliantly, clean the text, and summarise it with two or more techniques.
+
+## 3.1 Compliant web scraping
+
+**Site choice and fair use.** The English Wikipedia article *Natural language processing* was chosen because its text is released under the Creative Commons Attribution-ShareAlike licence (CC BY-SA 4.0), which welcomes re-use with attribution, and because the topic matches the scenario. Scraping rules followed:
+
+1. public content only (no login or paywall);
+2. `robots.txt` is read and the article path is checked before downloading;
+3. a descriptive `User-Agent` with contact details is sent, as Wikimedia's policy requires;
+4. one page is requested once and saved locally (`q3_raw_page.html`), so analysis never needs a second request;
+5. the source, licence and access date are recorded and cited with every figure.
+
+The download code (not re-run when the notebook is knitted, so the notebook works offline and never re-requests the page):
+
+```{r download, eval = FALSE}
+ua <- "ITBDA4-14-Project2-Coursework/1.0 (Eduvos student research; single page request; contact: <your e-mail>)"
+robots <- httr::GET("https://en.wikipedia.org/robots.txt", httr::user_agent(ua))
+# ... robots_allows(content(robots, as = "text"), "/wiki/Natural_language_processing") must be TRUE ...
+resp <- httr::GET(page_url, httr::user_agent(ua))
+writeBin(httr::content(resp, as = "raw"), snapshot)
+```
+
+### Parse the saved page into an R data structure
+
+```{r parse}
+page <- read_html(paste(readLines(snapshot, warn = FALSE, encoding = "UTF-8"), collapse = "\n"))
+page_title  <- html_text2(html_element(page, "h1"))
+lastmod     <- html_element(page, "#footer-info-lastmod")
+last_edited <- if (inherits(lastmod, "xml_missing")) "not stated" else trimws(html_text2(lastmod))
+accessed    <- format(as.Date(file.info(snapshot)$mtime), "%d %B %Y")
+
+bodies <- html_elements(page, "div.mw-parser-output")
+body   <- bodies[[which.max(vapply(bodies, function(b) nchar(html_text(b)), integer(1)))]]
+for (sel in c("sup", "style", "script", "table", "figure", ".mw-editsection", ".reference", ".noprint",
+              ".navbox", ".hatnote", ".mwe-math-element", ".thumb", ".ambox", ".mw-empty-elt",
+              ".metadata", ".sidebar", ".shortdescription")) {
+  nodes <- html_elements(body, sel); if (length(nodes) > 0) xml_remove(nodes)
+}
+nodes <- html_elements(body, xpath = paste0(
+  ".//*[self::h2 or self::h3 or self::h4 or ",
+  "(self::p and not(ancestor::li)) or ",
+  "((self::ul or self::ol) and not(ancestor::li) and not(ancestor::ul) and not(ancestor::ol))]"))
+
+sec <- "Introduction"; subsec <- NA_character_; rows <- list()
+add_row <- function(type, txt) {
+  txt <- trimws(txt)
+  if (nchar(txt) >= 20) rows[[length(rows) + 1]] <<- data.frame(section = sec, subsection = subsec, type = type, text = txt)
+}
+for (node in nodes) {
+  nm <- xml_name(node)
+  if (nm %in% c("h2", "h3", "h4")) {
+    htxt <- trimws(html_text2(node))
+    if (nm == "h2") { sec <- htxt; subsec <- NA_character_ } else subsec <- htxt
+  } else if (nm == "p") add_row("paragraph", html_text2(node))
+  else for (it in html_elements(node, xpath = "./li")) add_row("list item", html_text2(it))
+}
+web_df <- do.call(rbind, rows)
+web_df <- data.frame(id = seq_len(nrow(web_df)), web_df)
+
+wiki_data <- list(meta = list(source = "Wikipedia (English)", title = page_title, url = page_url,
+                              accessed = accessed, last_edited = last_edited, licence = "CC BY-SA 4.0"),
+                  content = web_df)
+str(wiki_data$meta)
+cat("Extracted", nrow(web_df), "text blocks in", length(unique(web_df$section)), "sections\n")
+knitr::kable(head(transform(web_df[, c("id", "section", "type")], text = paste0(substr(web_df$text, 1, 60), "...")), 6))
+```
+
+```{r sections}
+knitr::kable(as.data.frame(table(Section = factor(web_df$section, levels = unique(web_df$section)))),
+             col.names = c("Section", "Text blocks"))
+```
+
+## 3.2 Text pre-processing
+
+```{r preprocess}
+count_words <- function(x) sum(vapply(strsplit(trimws(x), "\\s+"), function(w) sum(nzchar(w)), integer(1)))
+custom_stop <- c("also", "may", "can", "one", "used", "use", "using", "many", "well", "often", "called",
+                 "known", "two", "new", "first", "however", "based", "within", "including", "example",
+                 "examples", "such", "like", "since", "among", "per", "will", "would", "could", "much",
+                 "various", "several", "became", "become", "due", "thus", "eg", "etc")
+stop_all <- unique(c(tm::stopwords("english"), custom_stop))
+
+# 1. remove non-pertinent sections
+nonpert_rx <- "^(references|external links|see also|further reading|notes|sources|bibliography|citations|footnotes)$"
+clean_df <- web_df[!grepl(nonpert_rx, trimws(web_df$section), ignore.case = TRUE), ]
+
+# 2. remove citation markers, URLs, entities, curly quotes
+strip_markup <- function(x) {
+  x <- gsub("\\[[^]]*\\]", " ", x)
+  x <- gsub("https?://[^ ]+|www\\.[^ ]+", " ", x)
+  x <- gsub("&[a-z]+;|&#[0-9]+;", " ", x)
+  x <- gsub("[\u2018\u2019\u201B`\u00B4]", "'", x, perl = TRUE)
+  x <- gsub("[\u201C\u201D]", "\"", x, perl = TRUE)
+  x <- gsub("[\u2013\u2014]", " ", x, perl = TRUE)
+  x <- gsub("[\r\n\t]", " ", x)
+  gsub("\\s+", " ", trimws(x))
+}
+clean_df$text_clean <- strip_markup(clean_df$text)
+
+# 3-5. lower case, remove punctuation/numbers, stop words and short words
+tokenise <- function(x) {
+  x <- tolower(x); x <- gsub("'s\\b", "", x, perl = TRUE); x <- gsub("[^a-z ]", " ", x)
+  w <- unlist(strsplit(x, " +")); w[nchar(w) >= 3 & !(w %in% stop_all)]
+}
+clean_df$words <- lapply(clean_df$text_clean, tokenise)
+tokens_before <- unlist(lapply(clean_df$text_clean, function(x) {
+  w <- unlist(strsplit(gsub("[^a-z ]", " ", tolower(x)), " +")); w[nzchar(w)] }))
+
+steps <- data.frame(
+  step = c("0. Raw extracted text (all sections)", "1. Remove non-pertinent sections",
+           "2. Remove citation markers, URLs, entities, odd symbols",
+           "3. Lower case, remove punctuation and numbers", "4. Remove stop words and words shorter than 3 letters"),
+  words = c(count_words(web_df$text), count_words(clean_df$text), count_words(clean_df$text_clean),
+            length(tokens_before), length(unlist(clean_df$words))))
+steps$change <- c(NA, diff(steps$words))
+knitr::kable(steps, caption = "Words remaining after each pre-processing step (step 3 can rise because hyphenated words are split)")
+
+# 6. stemming, with stem completion so that charts show real words
+tok <- data.frame(section = rep(clean_df$section, lengths(clean_df$words)), word = unlist(clean_df$words))
+tok$stem <- SnowballC::wordStem(tok$word, language = "english")
+tb   <- table(tok$stem)
+freq <- data.frame(stem = names(tb), freq = as.integer(tb))
+lab  <- tapply(tok$word, tok$stem, function(w) names(sort(table(w), decreasing = TRUE))[1])
+freq$term  <- as.character(lab[freq$stem])
+freq       <- freq[order(-freq$freq, freq$term), ]
+freq$share <- round(100 * freq$freq / sum(freq$freq), 2)
+cat("Unique words before stemming:", length(unique(tok$word)), "| unique terms after stemming:", length(unique(tok$stem)), "\n")
+```
+
+```{r preprocess-example}
+i <- which(nchar(clean_df$text) > 200)[1]
+cat("RAW:  ", substr(clean_df$text[i], 1, 280), "...\n\n")
+cat("CLEAN:", paste(head(clean_df$words[[i]], 35), collapse = " "), "...\n")
+```
+
+## 3.3 Text summarisation
+
+Caption used on all figures: *Source: Wikipedia, "`r page_title`" (CC BY-SA 4.0), accessed `r accessed`.*
+
+```{r caption, include = FALSE}
+caption_txt <- paste0("Source: Wikipedia, '", page_title, "' (CC BY-SA 4.0), accessed ", accessed)
+```
+
+### Technique 1 - term frequency and TF-IDF keywords
+
+```{r freq-plot, fig.width = 9, fig.height = 5.5}
+top_df <- head(freq, 15); top_df$term <- factor(top_df$term, levels = rev(top_df$term))
+ggplot(top_df, aes(x = term, y = freq)) +
+  geom_col(fill = "steelblue") + geom_text(aes(label = freq), hjust = -0.2, size = 3.5) +
+  coord_flip() + expand_limits(y = max(top_df$freq) * 1.1) +
+  labs(title = "Top 15 most frequent terms", subtitle = paste0("Pre-processed text of the Wikipedia article '", page_title, "'"),
+       x = "Term (stem completed to the most common word form)", y = "Frequency (number of occurrences)", caption = caption_txt) +
+  theme_minimal(base_size = 12)
+```
+
+```{r cloud, fig.width = 8, fig.height = 5.5}
+wc <- head(freq, 50); set.seed(seed)
+par(mar = c(0, 0, 2.5, 0))
+wordcloud(wc$term, wc$freq, scale = c(3.5, 0.7), min.freq = 1, random.order = FALSE, colors = brewer.pal(8, "Dark2"))
+title(main = paste0("Word cloud of the 50 most frequent terms - ", page_title), cex.main = 1.1)
+```
+
+Each section is treated as a document to find the words that **characterise** it (TF-IDF):
+
+```{r tfidf, fig.width = 10, fig.height = 6.5}
+sec_sizes  <- table(tok$section)
+big_secs   <- names(sort(sec_sizes[sec_sizes >= 50], decreasing = TRUE))[1:min(6, sum(sec_sizes >= 50))]
+all_secs   <- names(sec_sizes); N <- length(all_secs)
+doc_freq   <- table(unlist(lapply(all_secs, function(s) unique(tok$stem[tok$section == s]))))
+tfidf_df <- do.call(rbind, lapply(big_secs, function(s) {
+  st <- tok$stem[tok$section == s]; cnt <- table(st)
+  d  <- data.frame(section = s, stem = names(cnt),
+                   tf_idf = (as.numeric(cnt) / length(st)) * log(N / as.numeric(doc_freq[names(cnt)])))
+  d  <- head(d[order(-d$tf_idf), ], 5); d$term <- as.character(lab[d$stem]); d
+}))
+tfidf_df$term_id <- factor(seq_len(nrow(tfidf_df)), levels = rev(seq_len(nrow(tfidf_df))))
+tfidf_df$section <- factor(tfidf_df$section, levels = big_secs)
+ggplot(tfidf_df, aes(x = term_id, y = tf_idf, fill = section)) +
+  geom_col(show.legend = FALSE) + coord_flip() + facet_wrap(~ section, scales = "free") +
+  scale_x_discrete(labels = setNames(tfidf_df$term, tfidf_df$term_id)) +
+  labs(title = "Characteristic words per section (TF-IDF)",
+       subtitle = "Higher TF-IDF = frequent in this section but rare in the other sections",
+       x = "Term", y = "TF-IDF score", caption = caption_txt) + theme_minimal(base_size = 11)
+```
+
+### Techniques 2 and 3 - extractive summaries
+
+Sentences are split from the article paragraphs. **Technique 2** scores each sentence by the normalised frequency of its words. **Technique 3 (TextRank)** builds a graph in which sentences are connected by their TF-IDF cosine similarity and ranks them with PageRank.
+
+```{r summaries}
+split_sentences <- function(x) {
+  x <- gsub("\\b(e\\.g|i\\.e|etc|vs|Dr|Mr|Mrs|Prof|Fig|approx|cf|al)\\.", "\\1<dot>", x)
+  s <- unlist(strsplit(x, "(?<=[.!?])\\s+(?=[A-Z\"'])", perl = TRUE))
+  trimws(gsub("<dot>", ".", s, fixed = TRUE))
+}
+para <- clean_df[clean_df$type == "paragraph", ]
+sent_df <- do.call(rbind, lapply(seq_len(nrow(para)), function(i) {
+  s <- split_sentences(para$text_clean[i])
+  if (length(s) == 0) NULL else data.frame(section = para$section[i], sentence = s)
+}))
+sent_df$tokens   <- lapply(sent_df$sentence, function(s) SnowballC::wordStem(tokenise(s), language = "english"))
+sent_df          <- sent_df[lengths(sent_df$tokens) >= 6, ]
+rownames(sent_df) <- NULL
+sent_df$sent_id  <- seq_len(nrow(sent_df))
+n_sum <- 5
+
+# Technique 2: frequency-based scoring
+tf_norm <- setNames(freq$freq / max(freq$freq), freq$stem)
+sent_df$freq_score <- vapply(sent_df$tokens, function(tk) sum(tf_norm[tk], na.rm = TRUE) / sqrt(length(tk)), numeric(1))
+pick_freq <- sort(head(order(-sent_df$freq_score), n_sum))
+
+# Technique 3: TextRank
+vocab <- unique(unlist(sent_df$tokens))
+M <- matrix(0, nrow(sent_df), length(vocab), dimnames = list(NULL, vocab))
+for (i in seq_len(nrow(sent_df))) { ct <- table(sent_df$tokens[[i]]); M[i, names(ct)] <- as.numeric(ct) }
+W <- sweep(M, 2, log(nrow(M) / pmax(colSums(M > 0), 1)), `*`)
+nr <- sqrt(rowSums(W^2)); nr[nr == 0] <- 1
+Wn <- W / nr; S <- Wn %*% t(Wn); diag(S) <- 0
+rs <- rowSums(S); rs[rs == 0] <- 1; P <- S / rs
+d <- 0.85; n <- nrow(S); r <- rep(1 / n, n)
+for (it in 1:100) { r_new <- (1 - d) / n + d * as.numeric(t(P) %*% r); if (sum(abs(r_new - r)) < 1e-8) { r <- r_new; break }; r <- r_new }
+sent_df$textrank <- r
+pick_tr <- sort(head(order(-sent_df$textrank), n_sum))
+
+cat("Sentences available:", nrow(sent_df), "\n\n=== TECHNIQUE 2: frequency-based summary ===\n")
+for (i in seq_along(pick_freq)) cat(strwrap(paste0(i, ". ", sent_df$sentence[pick_freq[i]]), width = 95, exdent = 3), sep = "\n")
+cat("\n=== TECHNIQUE 3: TextRank summary ===\n")
+for (i in seq_along(pick_tr)) cat(strwrap(paste0(i, ". ", sent_df$sentence[pick_tr[i]]), width = 95, exdent = 3), sep = "\n")
+article_words <- count_words(sent_df$sentence)
+cat("\nArticle length (words in sentences):", article_words,
+    "| frequency summary:", count_words(sent_df$sentence[pick_freq]),
+    "words | TextRank summary:", count_words(sent_df$sentence[pick_tr]), "words\n")
+cat("Sentences chosen by both methods:", length(intersect(pick_freq, pick_tr)), "of", n_sum, "\n")
+```
+
+```{r textrank-plot, fig.width = 10, fig.height = 5}
+top_s <- head(sent_df[order(-sent_df$textrank), ], 10)
+top_s$label      <- factor(paste0("S", top_s$sent_id, ": ", substr(top_s$sentence, 1, 60), "..."), levels = rev(paste0("S", top_s$sent_id, ": ", substr(top_s$sentence, 1, 60), "...")))
+top_s$in_summary <- ifelse(top_s$sent_id %in% sent_df$sent_id[pick_tr], "Selected for summary", "Not selected")
+ggplot(top_s, aes(x = label, y = textrank, fill = in_summary)) +
+  geom_col() + coord_flip() +
+  scale_fill_manual(values = c("Selected for summary" = "darkorange", "Not selected" = "grey70")) +
+  labs(title = "TextRank: ten highest-ranked sentences",
+       subtitle = "Sentences are ranked by how similar they are to many other sentences in the article",
+       x = "Sentence (number and opening words)", y = "TextRank score", fill = NULL, caption = caption_txt) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+## Findings
+
+- The vocabulary is dominated by *language*, *word*, *NLP*, *natural* and *processing*, followed by *rule*, *approach*, *cognitive* and *machine*. This reflects an article about the field itself and its shift from rule-based to statistical and neural approaches.
+- TF-IDF separates the sections: **History** is characterised by words such as *machine*, *developed* and *translation*, **Approaches** by *rule*, *approach*, *network* and *statistical*, **Common NLP tasks** by task-specific words such as *token* and *index*, and **General tendencies** by *cognitive*.
+- The two extractive summaries agree on the definition of NLP, the main tasks and the move to machine learning. TextRank favours sentences that connect many topics, whereas frequency scoring favours sentences dense with the most common words, so it can pick a long, detailed sentence.
+- Limitations: a Wikipedia article changes over time (see the last-edited date), extractive summaries copy whole sentences instead of paraphrasing, and stemming can merge unrelated words.
